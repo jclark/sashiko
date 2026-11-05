@@ -45,6 +45,9 @@ pub struct WorkerOptions {
     pub baseline: Option<String>,
     pub prompts: PathBuf,
     pub review_patch_index: Option<i64>,
+    /// Review only these patch indices (`sashiko review --only`), keeping the
+    /// rest of the series as context. Local patch, 2026-11-03.
+    pub review_patch_indices: Option<Vec<i64>>,
     pub review_commit: Option<String>,
     pub reuse_worktree: Option<PathBuf>,
     pub custom_prompt: Option<String>,
@@ -61,6 +64,7 @@ impl Default for WorkerOptions {
             baseline: None,
             prompts: PathBuf::from("projects/linux/prompts"),
             review_patch_index: None,
+            review_patch_indices: None,
             review_commit: None,
             reuse_worktree: None,
             custom_prompt: None,
@@ -82,6 +86,7 @@ pub struct ReviewOptions {
     pub custom_prompt: Option<String>,
     pub agent: bool,
     pub report_preexisting: bool,
+    pub only: Option<Vec<i64>>,
 }
 
 impl Default for ReviewOptions {
@@ -93,6 +98,7 @@ impl Default for ReviewOptions {
             custom_prompt: None,
             agent: false,
             report_preexisting: false,
+            only: None,
         }
     }
 }
@@ -286,6 +292,7 @@ pub async fn run_git_review(
             current_tree: true,
             agent: options.agent,
             report_preexisting: options.report_preexisting,
+            review_patch_indices: options.only,
             ..WorkerOptions::default()
         },
         settings,
@@ -986,6 +993,12 @@ async fn run_worker_in_worktree(
             patches
                 .iter()
                 .filter(|p| p.index == target_idx)
+                .cloned()
+                .collect()
+        } else if let Some(indices) = &options.review_patch_indices {
+            patches
+                .iter()
+                .filter(|p| indices.contains(&p.index))
                 .cloned()
                 .collect()
         } else {
