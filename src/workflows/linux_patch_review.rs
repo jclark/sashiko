@@ -3798,7 +3798,28 @@ pub fn resolve_post_verification_stages_with_options(
     temperature: f32,
 ) -> Vec<Box<dyn ExecutableStage<LinuxPatchReviewState>>> {
     let effort = state.effort;
-    let batches = batch_inconclusive_concerns_by_severity(&state.inconclusive_concerns);
+    // A pre-existing finding is kept out of the report unless
+    // --report-preexisting is given (record_verified_findings), so verifying
+    // one then is work whose result is thrown away. Local patch, 2026-11-03.
+    let wanted: Vec<Value> = state
+        .inconclusive_concerns
+        .iter()
+        .filter(|item| {
+            state.report_preexisting
+                || !item
+                    .get("preexisting")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    let skipped = state.inconclusive_concerns.len() - wanted.len();
+    if skipped > 0 {
+        tracing::info!(
+            "Skipping post-verification of {skipped} pre-existing candidate(s); pass --report-preexisting to verify them"
+        );
+    }
+    let batches = batch_inconclusive_concerns_by_severity(&wanted);
     batches
         .into_iter()
         .enumerate()
