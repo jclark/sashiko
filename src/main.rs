@@ -176,6 +176,11 @@ enum Commands {
         )]
         related_preexisting_min_severity: sashiko::db::SeverityFloor,
 
+        /// Review only these patches of the range, by 1-based index (for
+        /// example 2,5); the whole range is still the series they are reviewed in
+        #[arg(long, value_delimiter = ',')]
+        only: Option<Vec<i64>>,
+
         /// Custom prompt to append to the review task
         #[arg(long)]
         custom_prompt: Option<String>,
@@ -821,6 +826,7 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
                 report_preexisting,
                 report_related_preexisting,
                 related_preexisting_min_severity,
+                only,
                 custom_prompt,
                 prompts,
                 format,
@@ -845,6 +851,7 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
                     settings,
                     *report_preexisting,
                     related_preexisting,
+                    only.clone(),
                     custom_prompt.clone(),
                     resolve_prompts_path(prompts.clone(), project)?,
                     *format,
@@ -926,6 +933,7 @@ async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
                         baseline: baseline.clone(),
                         prompts: resolve_prompts_path(prompts.clone(), project)?,
                         review_patch_index: *review_patch_index,
+                        review_patch_indices: None,
                         review_commit: review_commit.clone(),
                         reuse_worktree: reuse_worktree.clone(),
                         custom_prompt: custom_prompt.clone(),
@@ -2928,6 +2936,7 @@ async fn handle_review_command(
     mut settings: Settings,
     report_preexisting: bool,
     related_preexisting: RelatedPreexistingMode,
+    only: Option<Vec<i64>>,
     custom_prompt: Option<String>,
     prompts: PathBuf,
     format: OutputFormat,
@@ -3165,6 +3174,7 @@ async fn handle_review_command(
             agent,
             report_preexisting,
             related_preexisting,
+            only,
         },
         &settings,
         Some(&progress),
