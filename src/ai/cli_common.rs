@@ -73,7 +73,7 @@ fn escape_frames(content: &str) -> String {
 /// seconds is the longest such silence measured across 79 runs.  The value
 /// clears that with room to spare, because killing a live review costs the
 /// whole review while a hung one costs only the wait.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(900);
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Build the full text prompt from the AiRequest.
 /// Embeds system prompt, conversation history, tool definitions, and instructions.
