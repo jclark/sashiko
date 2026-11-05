@@ -75,6 +75,130 @@ fn escape_frames(content: &str) -> String {
 /// whole review while a hung one costs only the wait.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 
+/// Build the prompt as a list of text blocks for a CLI that takes structured
+/// input (`claude --input-format stream-json`), arranged so that one request
+/// is a block-aligned prefix of the next.
+///
+/// Sashiko re-sends the whole conversation on every turn. Anthropic's prompt
+/// cache matches only at content-block boundaries, so a single text block that
+/// grows each turn never hits: every turn rewrote the full context into the
+/// cache (measured 2026-11-03: 14% of 50M prompt tokens were cache reads).
+/// Here the first block holds everything that is fixed for the conversation
+/// (system prompt, tool list and response instructions, which `build_prompt`
+/// puts at the end), and every later block starts at an assistant message, so
+/// turn N+1 adds one block after the blocks of turn N and reads them from the
+/// cache written by turn N.
+///
+/// The text of each message is framed exactly as in `build_prompt`.
+pub fn build_prompt_blocks(request: &AiRequest) -> Vec<String> {
+    let mut header = String::new();
+    if let Some(sys) = &request.system {
+        header.push_str("<system>\n");
+        header.push_str(&escape_frames(sys));
+        header.push_str("\n</system>\n\n");
+    }
+    header.push_str(&response_instructions(request));
+
+    let mut blocks = vec![header];
+    let mut current = String::new();
+    for msg in &request.messages {
+        if matches!(msg.role, AiRole::Assistant) && !current.is_empty() {
+            blocks.push(std::mem::take(&mut current));
+        }
+        push_message(&mut current, msg);
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+    // Claude Code trims trailing whitespace from the last block of the
+    // message, so a block that ends in whitespace is sent one way while it is
+    // last and another once a turn follows it, and the cache entry written
+    // for it never matches again (measured 2026-11-03: every turn missed
+    // until the blocks were trimmed). Trim them all, so each block is sent
+    // the same way in every request.
+    blocks
+        .into_iter()
+        .map(|b| b.trim_end().to_string())
+        .filter(|b| !b.is_empty())
+        .collect()
+}
+
+fn push_message(out: &mut String, msg: &crate::ai::AiMessage) {
+    match &msg.role {
+        AiRole::System => {}
+        AiRole::User => {
+            out.push_str("<user>\n");
+            if let Some(c) = &msg.content {
+                out.push_str(&escape_frames(c));
+            }
+            out.push_str("\n</user>\n\n");
+        }
+        AiRole::Assistant => {
+            out.push_str("<assistant>\n");
+            if let Some(c) = &msg.content {
+                out.push_str(&escape_frames(c));
+            }
+            if let Some(calls) = &msg.tool_calls {
+                for call in calls {
+                    out.push_str(&format!(
+                        "<tool_call id=\"{}\" name=\"{}\">\n{}\n</tool_call>\n",
+                        escape_frames(&call.id),
+                        escape_frames(&call.function_name),
+                        escape_frames(&call.arguments.to_string())
+                    ));
+                }
+            }
+            out.push_str("</assistant>\n\n");
+        }
+        AiRole::Tool => {
+            let id = msg.tool_call_id.as_deref().unwrap_or("?");
+            out.push_str(&format!("<tool_result id=\"{}\">\n", escape_frames(id)));
+            if let Some(c) = &msg.content {
+                out.push_str(&escape_frames(c));
+            }
+            out.push_str("\n</tool_result>\n\n");
+        }
+    }
+}
+
+/// The tool list and response-format instructions that `build_prompt` puts
+/// after the conversation.
+fn response_instructions(request: &AiRequest) -> String {
+    let mut out = String::new();
+    if let Some(tools) = &request.tools
+        && !tools.is_empty()
+    {
+        out.push_str("<available_tools>\n");
+        for tool in tools {
+            out.push_str(&format!(
+                "- name: {}\n  description: {}\n  parameters: {}\n\n",
+                tool.name, tool.description, tool.parameters
+            ));
+        }
+        out.push_str("</available_tools>\n\n");
+        out.push_str(
+            "RESPONSE FORMAT: You MUST respond with a SINGLE valid JSON object only (no markdown, no explanation).\n\
+             To call tools: {\"tool_calls\": [{\"id\": \"c1\", \"function_name\": \"TOOL_NAME\", \"arguments\": {ARGS}}, {\"id\": \"c2\", \"function_name\": \"OTHER_TOOL\", \"arguments\": {ARGS2}}]}\n\
+             Put ALL tool calls in ONE tool_calls array. Do NOT output multiple JSON objects.\n\
+             For your final answer: {\"content\": \"YOUR RESPONSE\"}\n\
+             Do not mix both. Output exactly one JSON object.\n",
+        );
+    } else if let Some(instruction) = request
+        .response_format
+        .as_ref()
+        .and_then(|f| f.format_json_schema_instruction())
+    {
+        out.push_str(&instruction);
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push_str(
+            "\nThe conversation follows. Reply to its last message, following the instructions above.\n",
+        );
+    }
+    out
+}
+
 /// Build the full text prompt from the AiRequest.
 /// Embeds system prompt, conversation history, tool definitions, and instructions.
 pub fn build_prompt(request: &AiRequest) -> String {

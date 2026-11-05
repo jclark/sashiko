@@ -35,7 +35,8 @@ use tokio::process::Command;
 use tracing::debug;
 
 use super::cli_common::{
-    CliIoError, IDLE_TIMEOUT, build_prompt, parse_inner_response, spawn_cli, write_prompt_and_wait,
+    CliIoError, IDLE_TIMEOUT, build_prompt_blocks, parse_inner_response, spawn_cli,
+    write_prompt_and_wait,
 };
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiUsage, ClassifyAiError,
@@ -120,7 +121,7 @@ fn format_cli_exit_error(
     // Try to extract the actual error message from the JSON output.
     // The CLI emits a JSON object with is_error=true and the reason
     // in the "result" field even when it exits non-zero.
-    if let Ok(outer) = serde_json::from_str::<Value>(raw)
+    if let Ok(outer) = parse_cli_output(raw)
         && let Some(msg) = outer["result"].as_str()
     {
         return ClaudeCliError::Cli(redact_secret(msg));
@@ -148,8 +149,18 @@ pub fn build_claude_args(model: &str, effort: Option<&str>) -> Vec<String> {
     // Isolation arguments/settings verified with Claude Code 2.1.170.
     let mut args = vec![
         "--print".to_string(),
+        // stream-json input lets the conversation go in as separate content
+        // blocks, so turns hit the prompt cache (see build_prompt_blocks), and
+        // stream-json output (which needs --verbose) with partial messages
+        // reports thinking and text deltas as the model works, so the idle
+        // watchdog measures real silence instead of capping each call. Without
+        // partial messages a thinking block arrives only when it is complete.
+        "--input-format".to_string(),
+        "stream-json".to_string(),
         "--output-format".to_string(),
-        "json".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--include-partial-messages".to_string(),
         "--no-session-persistence".to_string(),
         "--tools".to_string(),
         String::new(),
@@ -188,7 +199,7 @@ impl ClaudeCliProvider {
         binary: &std::ffi::OsStr,
         idle_timeout: Duration,
     ) -> Result<AiResponse> {
-        let prompt = build_prompt(&request);
+        let prompt = build_stream_input(&request);
 
         debug!("claude-cli prompt length: {} chars", prompt.len());
 
@@ -260,7 +271,56 @@ impl AiProvider for ClaudeCliProvider {
     }
 }
 
+/// The stdin for one call: a single stream-json user message whose content
+/// is the prompt blocks.
+///
+/// The first block (system prompt, tools and instructions, the same for every
+/// stage of a review) carries its own cache breakpoint, so each stage's first
+/// call reads it from the cache instead of writing it again. Claude Code puts
+/// its own breakpoint on the last block, and those have a one-hour TTL, which
+/// this one must match: the API rejects a shorter TTL before a longer one.
+pub fn build_stream_input(request: &AiRequest) -> String {
+    let content: Vec<Value> = build_prompt_blocks(request)
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| {
+            if i == 0 {
+                serde_json::json!({
+                    "type": "text",
+                    "text": text,
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"},
+                })
+            } else {
+                serde_json::json!({"type": "text", "text": text})
+            }
+        })
+        .collect();
+    let message = serde_json::json!({
+        "type": "user",
+        "message": {"role": "user", "content": content},
+    });
+    let mut line = message.to_string();
+    line.push('\n');
+    line
+}
+
+/// Finds the final result in the CLI's output: the last stream-json line
+/// carrying a `result` (the `{"type":"result",...}` event, which has the same
+/// fields as `--output-format json`), or else the whole output as one JSON
+/// object.
 fn parse_cli_output(raw: &str) -> Result<Value, ClaudeCliError> {
+    for line in raw.lines().rev() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<Value>(line)
+            && event.get("result").is_some()
+            && event.get("type").is_none_or(|t| t == "result")
+        {
+            return Ok(event);
+        }
+    }
     serde_json::from_str(raw).map_err(|e| {
         let redacted = redact_secret(raw);
         ClaudeCliError::Parse(format!("{}\nRaw: {}", e, utf8_prefix(&redacted, 200)))
@@ -315,7 +375,99 @@ mod isolation_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::{AiMessage, AiRole, AiTool, ToolCall};
     use serde_json::json;
+
+    fn msg(role: AiRole, content: &str) -> AiMessage {
+        AiMessage {
+            role,
+            content: Some(content.to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn tool_turn(messages: &mut Vec<AiMessage>, id: &str, result: &str) {
+        let mut call = msg(AiRole::Assistant, "");
+        call.content = None;
+        call.tool_calls = Some(vec![ToolCall {
+            id: id.to_string(),
+            function_name: "git_grep".to_string(),
+            arguments: json!({"pattern": "mdio"}),
+            thought_signature: None,
+        }]);
+        messages.push(call);
+        let mut res = msg(AiRole::Tool, result);
+        res.tool_call_id = Some(id.to_string());
+        messages.push(res);
+    }
+
+    fn tool_request(messages: Vec<AiMessage>) -> AiRequest {
+        AiRequest {
+            system: Some("You are a reviewer.".to_string()),
+            messages,
+            tools: Some(vec![AiTool {
+                name: "git_grep".to_string(),
+                description: "grep".to_string(),
+                parameters: json!({"type": "object"}),
+            }]),
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+            reasoning_effort: None,
+        }
+    }
+
+    #[test]
+    fn test_each_turn_extends_the_previous_blocks() {
+        let mut messages = vec![msg(AiRole::User, "Review this patch.")];
+        tool_turn(&mut messages, "c1", "first result");
+        let turn1 = build_prompt_blocks(&tool_request(messages.clone()));
+        tool_turn(&mut messages, "c2", "second result");
+        let turn2 = build_prompt_blocks(&tool_request(messages));
+
+        assert_eq!(turn2.len(), turn1.len() + 1);
+        assert_eq!(&turn2[..turn1.len()], &turn1[..]);
+        assert!(turn1[0].contains("<system>") && turn1[0].contains("<available_tools>"));
+        assert!(turn1[0].contains("RESPONSE FORMAT"));
+        assert!(turn2.last().unwrap().contains("second result"));
+        // A block must read the same whether or not it is last.
+        assert!(turn2.iter().all(|b| b.trim_end() == b));
+    }
+
+    #[test]
+    fn test_stream_input_is_one_user_message_of_text_blocks() {
+        let messages = vec![msg(AiRole::User, "Review this patch.")];
+        let line = build_stream_input(&tool_request(messages));
+        assert!(line.ends_with('\n') && line.trim_end().lines().count() == 1);
+        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        let content = v["message"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert!(content.iter().all(|b| b["type"] == "text"));
+        assert_eq!(content[0]["cache_control"]["ttl"], "1h");
+        assert!(content[1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn test_parse_cli_output_takes_the_stream_result_event() {
+        let raw = concat!(
+            r#"{"type":"system","subtype":"init","tools":[]}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"{\"content\":\"x\"}"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"content\":\"x\"}","usage":{"input_tokens":3,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":7}}"#,
+            "\n"
+        );
+        let outer = parse_cli_output(raw).unwrap();
+        assert_eq!(extract_cli_result(&outer).unwrap(), r#"{"content":"x"}"#);
+        let usage = parse_usage(&outer).unwrap();
+        assert_eq!(usage.prompt_tokens, 110);
+        assert_eq!(usage.cached_tokens, Some(100));
+    }
 
     #[test]
     fn test_parse_error_preview_handles_multibyte_cutoff() {
