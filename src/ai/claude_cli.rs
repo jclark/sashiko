@@ -494,11 +494,19 @@ mod tests {
             "\n",
             r#"{"type":"assistant","message":{"content":[{"type":"text","text":"{\"content\":\"x\"}"}]}}"#,
             "\n",
-            r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"content\":\"x\"}","usage":{"input_tokens":3,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":7}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"{\"content\":\"x\"}","structured_output":{"content":"x"},"usage":{"input_tokens":3,"output_tokens":5,"cache_read_input_tokens":100,"cache_creation_input_tokens":7}}"#,
             "\n"
         );
         let outer = parse_cli_output(raw).unwrap();
-        assert_eq!(extract_cli_result(&outer).unwrap(), r#"{"content":"x"}"#);
+        assert_eq!(outer["structured_output"]["content"], "x");
+        assert_eq!(
+            extract_cli_result(&outer, true).unwrap(),
+            r#"{"content":"x"}"#
+        );
+        assert_eq!(
+            extract_cli_result(&outer, false).unwrap(),
+            r#"{"content":"x"}"#
+        );
         let usage = parse_usage(&outer).unwrap();
         assert_eq!(usage.prompt_tokens, 110);
         assert_eq!(usage.cached_tokens, Some(100));
